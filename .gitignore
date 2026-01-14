@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+binance_data/
+downloads/
+parquet_data/
