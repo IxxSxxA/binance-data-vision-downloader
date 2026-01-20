@@ -1,6 +1,6 @@
 # Binance Data Downloader
 
-Download historical market data from Binance and convert to Parquet format.
+Download historical market data KLINE from Binance and convert to Parquet format.
 
 ## Quick Start
 
@@ -9,6 +9,7 @@ Download historical market data from Binance and convert to Parquet format.
 pip install -r requirements.txt
 ```
 
+```python
 # Download all BTCUSDT 1m data
 python downloader.py
 
@@ -20,16 +21,13 @@ python downloader.py --workers 10
 
 # Download ETHUSDT 5m data
 python downloader.py --symbol ETHUSDT --interval 5m
+```
 
-
-Features
-Download futures/spot data
-
-Filter by year/month
-
-Parallel downloads
-
-Auto-convert to Parquet
+### Features
+- Download futures/spot data
+- Filter by year/month
+- Parallel downloads
+- Auto-convert to Parquet
 
 Handle both CSV formats (with/without header)
 
