@@ -297,11 +297,11 @@ def main():
             files = sorted([f for f in os.listdir(FOLDER_TO_CHECK) if f.endswith('.parquet')])
             if files:
                 print("\nFile disponibili:")
-                for i, f in enumerate(files[:20], 1):  # Mostra solo primi 20
+                for i, f in enumerate(files[:100], 1):  # Mostra solo primi 100
                     print(f"  {i:2d}. {f}")
                 
                 if len(files) > 20:
-                    print(f"  ... e altri {len(files) - 20} file")
+                    print(f"  ... e altri {len(files) - 100} file")
                 
                 file_num = input("\nNumero file da analizzare (0 per tornare): ").strip()
                 if file_num.isdigit():
