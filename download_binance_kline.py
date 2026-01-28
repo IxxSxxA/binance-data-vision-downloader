@@ -16,6 +16,7 @@ import json
 import time
 from pathlib import Path
 import shutil
+import numpy as np
 
 
 class BinanceDataDownloader:
@@ -28,8 +29,7 @@ class BinanceDataDownloader:
         years_filter: Optional[List[int]] = None,
         months_filter: Optional[List[int]] = None,
         days_filter: Optional[List[int]] = None,
-        download_dir: str = "downloads",
-        output_dir: str = "parquet_data",
+        base_dir: str = "binance_data",
         config_file: str = "binance_config.json",
     ):
         self.symbol = symbol
@@ -39,8 +39,13 @@ class BinanceDataDownloader:
         self.years_filter = years_filter
         self.months_filter = months_filter
         self.days_filter = days_filter
-        self.download_dir = download_dir
-        self.output_dir = output_dir
+        self.base_dir = base_dir
+
+        # Crea directory specifiche per il simbolo
+        self.download_dir = os.path.join(base_dir, symbol, "zip_raw")
+        self.output_dir = os.path.join(base_dir, symbol, "parquet_raw")
+        self.consolidated_dir = os.path.join(base_dir, symbol, "parquet_consolidated")
+
         self.config_file = config_file
 
         # URL base
@@ -53,14 +58,16 @@ class BinanceDataDownloader:
         self.config = self.load_config()
 
         # Crea directory
-        os.makedirs(download_dir, exist_ok=True)
-        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(self.download_dir, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(self.consolidated_dir, exist_ok=True)
 
     def load_config(self) -> Dict:
         """Carica configurazione da file o crea default"""
         default_config = {
             "delete_zip_after_conversion": False,
-            "always_ask_delete_zip": True,
+            "delete_raw_parquet_after_consolidation": False,
+            "always_ask_deletion": True,
             "max_download_workers": 5,
             "download_retries": 3,
             "preferred_frequency": "monthly",
@@ -68,6 +75,7 @@ class BinanceDataDownloader:
             "skip_existing_files": True,
             "smart_year_detection": True,
             "symbol_start_dates": {},
+            "auto_consolidate": True,
         }
 
         try:
@@ -95,7 +103,7 @@ class BinanceDataDownloader:
     def get_symbol_start_year(self) -> Optional[int]:
         """
         Determina l'anno di inizio del trading per questo simbolo.
-        Usa un approccio binario per trovare il primo anno con dati disponibili.
+        Usa un approccio intelligente che cerca dati a partire da oggi all'indietro.
         """
         # Controlla cache nella configurazione
         cache_key = f"{self.symbol}_{self.data_type}"
@@ -104,43 +112,120 @@ class BinanceDataDownloader:
             if cached_year:
                 return int(cached_year)
 
-        # Se disabilitato o simbolo noto (BTC, ETH), usa valori predefiniti
+        # Se disabilitato, usa valori predefiniti
         if not self.config.get("smart_year_detection", True):
             return 2020
 
-        known_early_symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT"]
+        # Simboli conosciuti che hanno dati dal 2020
+        known_early_symbols = [
+            "BTCUSDT",
+            "ETHUSDT",
+            "BNBUSDT",
+            "XRPUSDT",
+            "ADAUSDT",
+            "DOGEUSDT",
+            "DOTUSDT",
+            "SOLUSDT",
+        ]
         if self.symbol in known_early_symbols:
             return 2020
 
-        print(f"🔍 Ricerca anno di inizio per {self.symbol}...")
+        print(f"🔍 Ricerca intelligente anno di inizio per {self.symbol}...")
 
-        # Prova anni recenti prima (approccio più efficiente)
         current_year = datetime.now().year
-        test_years = list(
-            range(current_year, 2019, -1)
-        )  # Dal più recente al più vecchio
+        current_month = datetime.now().month
 
-        for year in test_years:
-            # Prova con un URL di esempio (primo mese)
+        # Strategia: partiamo dal mese corrente e andiamo all'indietro
+        # Prima cerca dati mensili recenti, poi espandi la ricerca
+
+        # Fase 1: Cerca nell'ultimo anno
+        print(f"   Fase 1: Cerca dati recenti (ultimi 12 mesi)...")
+
+        found_year = None
+        found_month = None
+
+        # Cerca per 12 mesi all'indietro dal corrente
+        for month_offset in range(12):
+            test_date = datetime.now() - timedelta(days=30 * month_offset)
+            test_year = test_date.year
+            test_month = test_date.month
+
+            # Prova con URL mensile
             test_url = (
                 f"{self.base_url}data/{self.data_type}/monthly/"
-                f"klines/{self.symbol}/{self.interval}/{self.symbol}-{self.interval}-{year}-01.zip"
+                f"klines/{self.symbol}/{self.interval}/{self.symbol}-{self.interval}-{test_year}-{test_month:02d}.zip"
             )
 
             if self.check_file_exists(test_url):
-                print(f"✅ {self.symbol} disponibile dal {year}")
-                # Salva in cache
-                if "symbol_start_dates" not in self.config:
-                    self.config["symbol_start_dates"] = {}
-                self.config["symbol_start_dates"][cache_key] = year
-                self.save_config()
-                return year
+                print(f"   ✅ Trovati dati in {test_year}-{test_month:02d}")
+                found_year = test_year
+                found_month = test_month
+                break
 
-        # Se non trova nulla, prova l'anno corrente
-        print(
-            f"⚠️  Anno di inizio non determinato per {self.symbol}, uso {current_year}"
-        )
-        return current_year
+        if found_year:
+            # Ora espandi la ricerca all'indietro dal primo mese trovato
+            print(
+                f"   Fase 2: Espandi ricerca all'indietro da {found_year}-{found_month:02d}..."
+            )
+
+            start_year = found_year
+            for year in range(found_year - 1, 2016, -1):  # Cerca fino al 2017
+                # Prova il primo mese dell'anno
+                test_url = (
+                    f"{self.base_url}data/{self.data_type}/monthly/"
+                    f"klines/{self.symbol}/{self.interval}/{self.symbol}-{self.interval}-{year}-01.zip"
+                )
+
+                if not self.check_file_exists(test_url):
+                    # Se non trovato, prova l'ultimo mese dell'anno
+                    test_url = (
+                        f"{self.base_url}data/{self.data_type}/monthly/"
+                        f"klines/{self.symbol}/{self.interval}/{self.symbol}-{self.interval}-{year}-12.zip"
+                    )
+
+                    if not self.check_file_exists(test_url):
+                        # Anno senza dati, fermati qui
+                        print(f"   ⏹️  Nessun dato per {year}, fermo a {start_year}")
+                        break
+
+                start_year = year
+
+            print(f"✅ {self.symbol} disponibile dal {start_year}")
+
+            # Salva in cache
+            if "symbol_start_dates" not in self.config:
+                self.config["symbol_start_dates"] = {}
+            self.config["symbol_start_dates"][cache_key] = start_year
+            self.save_config()
+            return start_year
+
+        else:
+            # Nessun dato trovato negli ultimi 12 mesi
+            print(f"⚠️  Nessun dato trovato per {self.symbol} negli ultimi 12 mesi")
+
+            # Prova una ricerca più aggressiva
+            print(f"   Fase 3: Ricerca completa (2017-{current_year})...")
+
+            for year in range(current_year, 2016, -1):
+                # Prova un mese a caso (metà anno)
+                test_url = (
+                    f"{self.base_url}data/{self.data_type}/monthly/"
+                    f"klines/{self.symbol}/{self.interval}/{self.symbol}-{self.interval}-{year}-06.zip"
+                )
+
+                if self.check_file_exists(test_url):
+                    print(f"✅ Trovati dati in {year}")
+
+                    # Salva in cache
+                    if "symbol_start_dates" not in self.config:
+                        self.config["symbol_start_dates"] = {}
+                    self.config["symbol_start_dates"][cache_key] = year
+                    self.save_config()
+                    return year
+
+            # Se tutto fallisce, usa l'anno corrente
+            print(f"⚠️  Nessun dato trovato, uso {current_year} come fallback")
+            return current_year
 
     def get_zip_links_fallback(self) -> List[str]:
         """
@@ -153,8 +238,13 @@ class BinanceDataDownloader:
         current_month = datetime.now().month
         current_day = datetime.now().day
 
-        # Determina anno di inizio SMART
+        # Determina anno di inizio SMART (migliorato)
         start_year = self.get_symbol_start_year()
+
+        # Per simboli nuovi, assicurati di iniziare dall'anno giusto
+        if start_year > current_year:
+            start_year = current_year - 1 if current_year > 2020 else 2020
+            print(f"   ⚠️  Anno di inizio corretto a {start_year}")
 
         # Range di anni
         if self.years_filter:
@@ -183,7 +273,10 @@ class BinanceDataDownloader:
                     if year == current_year and month > current_month:
                         continue
 
-                    # Per anni precedenti, tutti i mesi sono validi
+                    # Per gli anni precedenti a start_year, salta
+                    if year < start_year:
+                        continue
+
                     month_str = f"{month:02d}"
                     filename = f"{self.symbol}-{self.interval}-{year}-{month_str}.zip"
                     full_url = (
@@ -207,6 +300,10 @@ class BinanceDataDownloader:
                 # Per daily, considera solo l'anno corrente per simboli nuovi
                 # (per evitare troppi URL)
                 if year < current_year and start_year == current_year:
+                    continue
+
+                # Salta anni precedenti a start_year
+                if year < start_year:
                     continue
 
                 for month in months:
@@ -246,6 +343,7 @@ class BinanceDataDownloader:
             f"📁 Generati {len(generated_links)} URL per il download ({self.frequency})"
         )
         print(f"   Anni: {years[0]}-{years[-1]}")
+        print(f"   Anno di inizio rilevato: {start_year}")
 
         if self.frequency == "daily" and len(generated_links) > 100:
             print(
@@ -519,74 +617,112 @@ class BinanceDataDownloader:
 
         return downloaded_files
 
-    def ask_delete_zip_files(self) -> bool:
-        """Chiede all'utente se eliminare i file ZIP"""
-        if not self.config.get("always_ask_delete_zip", True):
-            return self.config.get("delete_zip_after_conversion", False)
-
-        zip_files = [f for f in os.listdir(self.download_dir) if f.endswith(".zip")]
-        if not zip_files:
-            return False
-
-        total_size = (
-            sum(os.path.getsize(os.path.join(self.download_dir, f)) for f in zip_files)
-            / 1024
-            / 1024
-        )
-
-        print(f"\n📦 Hai {len(zip_files)} file ZIP ({total_size:.1f} MB)")
-
-        while True:
-            response = (
-                input("🗑️  Vuoi eliminare i file ZIP dopo la conversione? (s/n/auto): ")
-                .lower()
-                .strip()
+    def ask_deletion_preferences(
+        self, zip_count: int, parquet_count: int
+    ) -> Tuple[bool, bool]:
+        """Chiede all'utente le preferenze di eliminazione"""
+        if not self.config.get("always_ask_deletion", True):
+            return (
+                self.config.get("delete_zip_after_conversion", False),
+                self.config.get("delete_raw_parquet_after_consolidation", False),
             )
 
-            if response == "s":
-                # Salva preferenza
-                self.config["delete_zip_after_conversion"] = True
-                self.config["always_ask_delete_zip"] = False
-                self.save_config()
-                return True
+        zip_size = 0
+        if os.path.exists(self.download_dir):
+            zip_files = [f for f in os.listdir(self.download_dir) if f.endswith(".zip")]
+            zip_size = (
+                sum(
+                    os.path.getsize(os.path.join(self.download_dir, f))
+                    for f in zip_files
+                )
+                / 1024
+                / 1024
+            )
 
-            elif response == "n":
-                # Salva preferenza
+        parquet_size = 0
+        if os.path.exists(self.output_dir):
+            parquet_files = [
+                f for f in os.listdir(self.output_dir) if f.endswith(".parquet")
+            ]
+            parquet_size = (
+                sum(
+                    os.path.getsize(os.path.join(self.output_dir, f))
+                    for f in parquet_files
+                )
+                / 1024
+                / 1024
+            )
+
+        print(f"\n📦 Hai:")
+        print(f"   {zip_count} file ZIP ({zip_size:.1f} MB)")
+        print(f"   {parquet_count} file Parquet raw ({parquet_size:.1f} MB)")
+
+        while True:
+            print("\n🗑️  Opzioni di eliminazione:")
+            print("   1. Mantieni tutti i file (ZIP + Parquet raw)")
+            print("   2. Elimina solo ZIP dopo conversione")
+            print("   3. Elimina tutto (ZIP + Parquet raw) dopo consolidamento")
+            print("   4. Usa impostazioni automatiche basate su spazio disco")
+
+            response = input("\n👉 Scegli un'opzione (1-4): ").strip()
+
+            if response == "1":
                 self.config["delete_zip_after_conversion"] = False
-                self.config["always_ask_delete_zip"] = False
+                self.config["delete_raw_parquet_after_consolidation"] = False
+                self.config["always_ask_deletion"] = False
                 self.save_config()
-                return False
+                return False, False
 
-            elif response == "auto":
-                # Usa impostazione automatica basata su spazio disco
+            elif response == "2":
+                self.config["delete_zip_after_conversion"] = True
+                self.config["delete_raw_parquet_after_consolidation"] = False
+                self.config["always_ask_deletion"] = False
+                self.save_config()
+                return True, False
+
+            elif response == "3":
+                self.config["delete_zip_after_conversion"] = True
+                self.config["delete_raw_parquet_after_consolidation"] = True
+                self.config["always_ask_deletion"] = False
+                self.save_config()
+                return True, True
+
+            elif response == "4":
                 import shutil
 
-                total, used, free = shutil.disk_usage(self.download_dir)
+                total, used, free = shutil.disk_usage(self.base_dir)
                 free_gb = free / (1024**3)
 
-                if free_gb < 5:  # Meno di 5GB liberi
+                if free_gb < 10:  # Meno di 10GB liberi
                     print(
-                        f"⚠️  Spazio disco limitato ({free_gb:.1f} GB liberi). Elimino automaticamente."
+                        f"⚠️  Spazio disco limitato ({free_gb:.1f} GB liberi). Elimino automaticamente tutto."
                     )
                     self.config["delete_zip_after_conversion"] = True
-                    self.config["always_ask_delete_zip"] = (
-                        True  # Chiedi ancora in futuro
-                    )
+                    self.config["delete_raw_parquet_after_consolidation"] = True
+                    self.config["always_ask_deletion"] = True  # Chiedi ancora in futuro
                     self.save_config()
-                    return True
+                    return True, True
+                elif free_gb < 50:  # Tra 10GB e 50GB
+                    print(
+                        f"⚠️  Spazio disco moderato ({free_gb:.1f} GB liberi). Elimino solo ZIP."
+                    )
+                    self.config["delete_zip_after_conversion"] = True
+                    self.config["delete_raw_parquet_after_consolidation"] = False
+                    self.config["always_ask_deletion"] = True  # Chiedi ancora in futuro
+                    self.save_config()
+                    return True, False
                 else:
                     print(
-                        f"✅ Spazio disco sufficiente ({free_gb:.1f} GB liberi). Mantengo i file."
+                        f"✅ Spazio disco sufficiente ({free_gb:.1f} GB liberi). Mantengo tutti i file."
                     )
                     self.config["delete_zip_after_conversion"] = False
-                    self.config["always_ask_delete_zip"] = (
-                        True  # Chiedi ancora in futuro
-                    )
+                    self.config["delete_raw_parquet_after_consolidation"] = False
+                    self.config["always_ask_deletion"] = True  # Chiedi ancora in futuro
                     self.save_config()
-                    return False
+                    return False, False
 
             else:
-                print("⚠️  Risposta non valida. Usa 's', 'n' o 'auto'")
+                print("⚠️  Risposta non valida. Scegli un'opzione da 1 a 4")
 
     def extract_to_parquet(self, delete_zip: bool = None):
         """Versione che VERIFICA correttamente se c'è header"""
@@ -597,15 +733,7 @@ class BinanceDataDownloader:
 
         if not zip_files:
             print("⚠️  Nessun file ZIP trovato!")
-            return
-
-        # Chiedi all'utente se eliminare i file ZIP
-        if delete_zip is None:
-            delete_zip = self.ask_delete_zip_files()
-        else:
-            # Forza l'eliminazione se specificato
-            if delete_zip:
-                print("🗑️  Eliminazione file ZIP abilitata (forzata da parametro)")
+            return 0
 
         print(f"\n🔄 Conversione {len(zip_files)} file in Parquet...")
 
@@ -678,14 +806,6 @@ class BinanceDataDownloader:
                     rename_map = {}
                     if "open_time" in df.columns:
                         rename_map["open_time"] = "timestamp"
-
-                    # Do not rename these columns
-                    # if 'count' in df.columns:
-                    #     rename_map['count'] = 'trades'
-                    # if 'taker_buy_volume' in df.columns:
-                    #     rename_map['taker_buy_volume'] = 'taker_buy_base'
-                    # if 'taker_buy_quote_volume' in df.columns:
-                    #     rename_map['taker_buy_quote_volume'] = 'taker_buy_quote'
 
                     if rename_map:
                         df.rename(columns=rename_map, inplace=True)
@@ -762,25 +882,288 @@ class BinanceDataDownloader:
         print(f"❌ Errori: {error_count}/{len(zip_files)}")
         print(f"{'='*60}")
 
-        # Suggerimento per l'utente
-        if success_count > 0 and delete_zip:
-            print("\n💡 Suggerimento: I file ZIP sono stati eliminati.")
-            print("   Per ricrearli, devi ridiscercare i dati.")
-        elif success_count > 0 and not delete_zip:
-            total_zip_size = (
-                sum(
-                    os.path.getsize(os.path.join(self.download_dir, f))
-                    for f in zip_files
+        return success_count
+
+    def analyze_parquet_files(self):
+        """Analizza tutti i file Parquet e mostra statistiche utili"""
+
+        parquet_files = sorted(
+            [f for f in os.listdir(self.output_dir) if f.endswith(".parquet")]
+        )
+
+        if not parquet_files:
+            print("⚠️  Nessun file Parquet trovato!")
+            return []
+
+        print(f"📁 Trovati {len(parquet_files)} file Parquet")
+        print("=" * 60)
+
+        all_data = []
+        total_rows = 0
+        total_size_mb = 0
+        schemas_consistent = True
+
+        # Analizza ogni file
+        for i, filename in enumerate(parquet_files, 1):
+            filepath = os.path.join(self.output_dir, filename)
+
+            try:
+                # Leggi il file
+                df = pd.read_parquet(filepath)
+
+                # Estrai informazioni
+                file_info = {
+                    "filename": filename,
+                    "rows": len(df),
+                    "size_mb": os.path.getsize(filepath) / 1024 / 1024,
+                    "start_date": df.index.min(),
+                    "end_date": df.index.max(),
+                    "columns": list(df.columns),
+                    "dtypes": dict(df.dtypes),
+                    "index_type": type(df.index).__name__,
+                }
+
+                all_data.append(file_info)
+                total_rows += file_info["rows"]
+                total_size_mb += file_info["size_mb"]
+
+                # Stampa info file
+                print(f"{i:3d}. {filename}")
+                print(f"     📊 Righe: {file_info['rows']:>7,}")
+                print(f"     💾 Dimensione: {file_info['size_mb']:>6.2f} MB")
+                print(
+                    f"     📅 Periodo: {file_info['start_date'].date()} - {file_info['end_date'].date()}"
                 )
-                / 1024
-                / 1024
-                if zip_files
-                else 0
+
+                # Controllo qualità dati
+                missing_values = df.isnull().sum().sum()
+                if missing_values > 0:
+                    print(f"     ⚠️  Valori mancanti: {missing_values}")
+
+            except Exception as e:
+                print(f"{i:3d}. {filename} - ❌ ERRORE: {str(e)[:80]}")
+                all_data.append({"filename": filename, "error": str(e)})
+
+        # ANALISI GENERALE
+        print(f"\n{'='*60}")
+        print("📊 ANALISI COMPLESSIVA")
+        print(f"{'='*60}")
+
+        if all_data and "rows" in all_data[0]:
+            # Statistiche generali
+            print(f"📈 Statistiche totali:")
+            print(f"   Totale file: {len([d for d in all_data if 'rows' in d])}")
+            print(f"   Totale righe: {total_rows:,}")
+            print(f"   Dimensione totale: {total_size_mb:.2f} MB")
+            print(f"   Media righe/file: {total_rows/len(all_data):,.0f}")
+            print(f"   Media dimensione/file: {total_size_mb/len(all_data):.2f} MB")
+
+            # Range date
+            all_starts = [d["start_date"] for d in all_data if "start_date" in d]
+            all_ends = [d["end_date"] for d in all_data if "end_date" in d]
+
+            if all_starts and all_ends:
+                overall_start = min(all_starts)
+                overall_end = max(all_ends)
+                print(f"\n📅 Copertura temporale complessiva:")
+                print(f"   Da: {overall_start}")
+                print(f"   A: {overall_end}")
+                print(f"   Giorni totali: {(overall_end - overall_start).days:,}")
+
+            # Verifica consistenza schema
+            print(f"\n🔍 Verifica consistenza schema:")
+            first_schema = all_data[0]
+            inconsistencies = []
+
+            for data in all_data[1:]:
+                if "columns" in data:
+                    if data["columns"] != first_schema["columns"]:
+                        inconsistencies.append(f"Colonne diverse in {data['filename']}")
+                    if data["index_type"] != first_schema["index_type"]:
+                        inconsistencies.append(
+                            f"Tipo indice diverso in {data['filename']}"
+                        )
+
+            if not inconsistencies:
+                print("   ✅ Tutti i file hanno schema CONSISTENTE!")
+                print(f"   🗂️  Schema standard:")
+                print(f"      Indice: {first_schema['index_type']}")
+                print(
+                    f"      Colonne ({len(first_schema['columns'])}): {', '.join(first_schema['columns'])}"
+                )
+            else:
+                print(f"   ❌ Trovate {len(inconsistencies)} inconsistenze!")
+                for inc in inconsistencies[:3]:
+                    print(f"      - {inc}")
+
+            # Analisi buchi temporali
+            print(f"\n🔎 Analisi continuità temporale:")
+
+            # Crea lista di periodi ordinati
+            periods = [
+                (d["start_date"], d["end_date"], d["filename"])
+                for d in all_data
+                if "start_date" in d
+            ]
+            periods.sort(key=lambda x: x[0])  # Ordina per data inizio
+
+            gaps = []
+            for i in range(len(periods) - 1):
+                current_end = periods[i][1]
+                next_start = periods[i + 1][0]
+
+                # Se c'è un gap maggiore di 2 minuti (120 secondi per dati 1m)
+                gap_hours = (next_start - current_end).total_seconds() / 3600
+                if gap_hours > 2 / 60:  # Più di 2 minuti
+                    gaps.append(
+                        {
+                            "gap_hours": gap_hours,
+                            "between": f"{periods[i][2]} e {periods[i+1][2]}",
+                            "from": current_end,
+                            "to": next_start,
+                        }
+                    )
+
+            if gaps:
+                print(f"   ⚠️  Trovati {len(gaps)} buchi temporali:")
+                for gap in gaps[:5]:  # Mostra solo primi 5 buchi
+                    print(f"      - {gap['gap_hours']:.2f} ore tra {gap['between']}")
+                    print(f"        ({gap['from']} → {gap['to']})")
+            else:
+                print("   ✅ Nessun buco temporale significativo trovato!")
+
+            # Statistiche per mese/anno
+            print(f"\n📅 Distribuzione per anno:")
+            years_data = {}
+            for data in all_data:
+                if "start_date" in data:
+                    year = data["start_date"].year
+                    if year not in years_data:
+                        years_data[year] = {"files": 0, "rows": 0, "size_mb": 0}
+                    years_data[year]["files"] += 1
+                    years_data[year]["rows"] += data["rows"]
+                    years_data[year]["size_mb"] += data["size_mb"]
+
+            for year in sorted(years_data.keys()):
+                print(
+                    f"   {year}: {years_data[year]['files']:2d} file, "
+                    f"{years_data[year]['rows']:8,} righe, "
+                    f"{years_data[year]['size_mb']:6.1f} MB"
+                )
+
+        return all_data
+
+    def create_master_file(self, output_filename="master_data.parquet"):
+        """Crea un unico file Parquet con tutti i dati"""
+
+        parquet_files = sorted(
+            [f for f in os.listdir(self.output_dir) if f.endswith(".parquet")]
+        )
+
+        if not parquet_files:
+            print("Nessun file da unire!")
+            return None
+
+        print(f"\n🔗 Unione di {len(parquet_files)} file in {output_filename}...")
+
+        all_dfs = []
+        for i, filename in enumerate(parquet_files, 1):
+            filepath = os.path.join(self.output_dir, filename)
+            try:
+                df = pd.read_parquet(filepath)
+                all_dfs.append(df)
+                print(f"  {i:3d}. {filename} - {len(df):,} righe")
+            except Exception as e:
+                print(f"  {i:3d}. {filename} - ❌ Errore: {str(e)[:50]}")
+
+        if not all_dfs:
+            print("❌ Nessun DataFrame valido da unire!")
+            return None
+
+        master_df = pd.concat(all_dfs).sort_index()
+        output_path = os.path.join(self.consolidated_dir, output_filename)
+        master_df.to_parquet(output_path, compression="snappy")
+
+        print(f"\n✅ File master creato: {output_path}")
+        print(f"   Righe totali: {len(master_df):,}")
+        print(f"   Periodo: {master_df.index.min()} - {master_df.index.max()}")
+        print(f"   Dimensione: {os.path.getsize(output_path)/1024/1024:.2f} MB")
+
+        return master_df
+
+    def consolidate_data(self, delete_raw_parquet: bool = False):
+        """Consolida tutti i dati in un unico file e chiede se eliminare i file raw"""
+
+        print(f"\n🔗 CONSOLIDAMENTO DATI")
+        print(f"=" * 60)
+
+        # Analizza i file esistenti
+        analysis = self.analyze_parquet_files()
+
+        if not analysis:
+            print("❌ Nessun dato da consolidare!")
+            return
+
+        # Chiedi conferma per il consolidamento
+        if not self.config.get("auto_consolidate", True):
+            confirm = (
+                input("\nVuoi consolidare i dati in un unico file? (s/n): ")
+                .strip()
+                .lower()
             )
-            print(
-                f"\n💡 Suggerimento: Hai ancora {len(zip_files)} file ZIP ({total_zip_size:.1f} MB)"
-            )
-            print("   Puoi eliminarli manualmente o eseguire con --delete-zip")
+            if confirm != "s":
+                print("❌ Consolidamento annullato")
+                return
+
+        # Crea il file master
+        master_df = self.create_master_file()
+
+        if master_df is not None:
+            # Chiedi all'utente se eliminare i file raw
+            if delete_raw_parquet:
+                self.delete_raw_files()
+            elif self.config.get("always_ask_deletion", True):
+                print(f"\n📦 Hai {len(analysis)} file Parquet raw")
+                raw_size = sum([d.get("size_mb", 0) for d in analysis])
+                print(f"   Dimensione totale: {raw_size:.1f} MB")
+
+                delete_raw = (
+                    input("\n🗑️  Vuoi eliminare i file Parquet raw? (s/n): ")
+                    .strip()
+                    .lower()
+                )
+                if delete_raw == "s":
+                    self.delete_raw_files()
+                else:
+                    print("✅ File raw mantenuti")
+
+        return master_df
+
+    def delete_raw_files(self):
+        """Elimina tutti i file raw (ZIP e Parquet)"""
+
+        # Elimina file ZIP
+        zip_count = 0
+        if os.path.exists(self.download_dir):
+            zip_files = [f for f in os.listdir(self.download_dir) if f.endswith(".zip")]
+            for zip_file in zip_files:
+                os.remove(os.path.join(self.download_dir, zip_file))
+                zip_count += 1
+
+        # Elimina file Parquet raw
+        parquet_count = 0
+        if os.path.exists(self.output_dir):
+            parquet_files = [
+                f for f in os.listdir(self.output_dir) if f.endswith(".parquet")
+            ]
+            for parquet_file in parquet_files:
+                os.remove(os.path.join(self.output_dir, parquet_file))
+                parquet_count += 1
+
+        print(f"\n🗑️  File eliminati:")
+        print(f"   ZIP: {zip_count} file")
+        print(f"   Parquet raw: {parquet_count} file")
+        print(f"✅ Solo il file consolidato rimane in: {self.consolidated_dir}")
 
     def interactive_mode(self):
         """Modalità interattiva per utenti meno esperti"""
@@ -791,6 +1174,18 @@ class BinanceDataDownloader:
         symbol = input(f"Simbolo (default: {self.symbol}): ").strip().upper()
         if symbol:
             self.symbol = symbol
+
+        # Aggiorna directory con nuovo simbolo
+        self.download_dir = os.path.join(self.base_dir, self.symbol, "zip_raw")
+        self.output_dir = os.path.join(self.base_dir, self.symbol, "parquet_raw")
+        self.consolidated_dir = os.path.join(
+            self.base_dir, self.symbol, "parquet_consolidated"
+        )
+
+        # Crea directory se necessario
+        os.makedirs(self.download_dir, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(self.consolidated_dir, exist_ok=True)
 
         # Intervallo
         interval = input(f"Intervallo (default: {self.interval}): ").strip()
@@ -866,6 +1261,7 @@ class BinanceDataDownloader:
         if self.days_filter:
             print(f"Giorni: {self.days_filter}")
         print(f"Thread: {self.config.get('max_download_workers', 5)}")
+        print(f"Directory download: {self.download_dir}")
         print(f"{'='*40}")
 
         confirm = input("\nConfermi il download? (s/n): ").strip().lower()
@@ -877,204 +1273,39 @@ class BinanceDataDownloader:
         downloaded = self.download_all()
 
         if downloaded:
-            convert = input("\nVuoi convertire in Parquet? (s/n): ").strip().lower()
-            if convert == "s":
-                self.extract_to_parquet()
+            # Conversione in Parquet
+            delete_zip, delete_raw = self.ask_deletion_preferences(len(downloaded), 0)
+            success_count = self.extract_to_parquet(delete_zip)
+
+            if success_count > 0:
+                # Consolida i dati
+                self.consolidate_data(delete_raw)
+
+        print("\n🎉 OPERAZIONE COMPLETATA!")
 
 
 def main():
-    """Funzione principale con interfaccia da riga di comando"""
-    parser = argparse.ArgumentParser(
-        description="Scarica dati storici da Binance e convertili in Parquet",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Esempi:
-  # Modalità interattiva
-  python script.py --interactive
-  
-  # Scarica tutto (con rilevamento intelligente dell'anno di inizio)
-  python script.py
-  
-  # Dati giornalieri per un nuovo simbolo
-  python script.py --symbol XPLUSDT --frequency daily
-  
-  # Scarica solo 2025
-  python script.py --years 2025
-  
-  # Scarica solo agosto e settembre 2025
-  python script.py --months 8 9 --years 2025
-  
-  # Scarica ETHUSDT 5m (rileva automaticamente dal 2020)
-  python script.py --symbol ETHUSDT --interval 5m
-  
-  # Download veloce con 10 thread
-  python script.py --workers 10
-  
-  # Solo download, senza conversione
-  python script.py --no-convert
-  
-  # Elimina file ZIP dopo conversione (chiede conferma)
-  python script.py --delete-zip
-  
-  # Disabilita rilevamento intelligente dell'anno
-  python script.py --no-smart-year
-        """,
-    )
-
-    parser.add_argument(
-        "--symbol", default="BTCUSDT", help="Coppia di trading (default: BTCUSDT)"
-    )
-    parser.add_argument(
-        "--interval", default="1m", help="Intervallo temporale (default: 1m)"
-    )
-    parser.add_argument(
-        "--data-type",
-        default="futures/um",
-        choices=["futures/um", "spot", "futures/cm"],
-        help="Tipo di dati (default: futures/um)",
-    )
-    parser.add_argument(
-        "--frequency",
-        default="monthly",
-        choices=["monthly", "daily"],
-        help="Frequenza (default: monthly)",
-    )
-    parser.add_argument(
-        "--years", type=int, nargs="+", help="Anni da scaricare (es: 2023 2024)"
-    )
-    parser.add_argument(
-        "--months",
-        type=int,
-        nargs="+",
-        choices=range(1, 13),
-        help="Mesi da scaricare (1-12)",
-    )
-    parser.add_argument(
-        "--days",
-        type=int,
-        nargs="+",
-        choices=range(1, 32),
-        help="Giorni da scaricare (1-31, solo per frequency=daily)",
-    )
-    parser.add_argument("--workers", type=int, help="Thread per download (default: 5)")
-    parser.add_argument(
-        "--no-convert", action="store_true", help="Non convertire in Parquet"
-    )
-    parser.add_argument(
-        "--delete-zip",
-        action="store_true",
-        help="Elimina file ZIP dopo conversione (chiede conferma)",
-    )
-    parser.add_argument(
-        "--force-delete-zip",
-        action="store_true",
-        help="Forza eliminazione ZIP senza chiedere",
-    )
-    parser.add_argument(
-        "--keep-zip", action="store_true", help="Mantieni sempre i file ZIP"
-    )
-    parser.add_argument(
-        "--no-skip-existing",
-        action="store_true",
-        help="Disabilita salto file esistenti",
-    )
-    parser.add_argument(
-        "--no-smart-year",
-        action="store_true",
-        help="Disabilita rilevamento intelligente anno di inizio",
-    )
-    parser.add_argument(
-        "--interactive", "-i", action="store_true", help="Avvia modalità interattiva"
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="binance_data",
-        help="Directory di output (default: binance_data)",
-    )
-
-    args = parser.parse_args()
-
-    # Se modalità interattiva, esegui e termina
-    if args.interactive:
-        downloader = BinanceDataDownloader(
-            symbol=args.symbol,
-            interval=args.interval,
-            data_type=args.data_type,
-            frequency=args.frequency,
-            years_filter=args.years,
-            months_filter=args.months,
-            days_filter=args.days,
-            download_dir=os.path.join(args.output_dir, "zips"),
-            output_dir=os.path.join(args.output_dir, "parquet"),
-        )
-        downloader.interactive_mode()
-        return
+    """Funzione principale"""
 
     print(
         f"""
     ╔══════════════════════════════════════════════╗
     ║          BINANCE DATA DOWNLOADER             ║
-    ╠══════════════════════════════════════════════╣
-    ║ Simbolo:    {args.symbol:>30} ║
-    ║ Intervallo: {args.interval:>30}   ║
-    ║ Tipo:       {args.data_type:>30}  ║
-    ║ Frequenza:  {args.frequency:>30}  ║
-    ║ Anni:       {str(args.years if args.years else 'Tutti'):>30}  ║
-    ║ Mesi:       {str(args.months if args.months else 'Tutti'):>30}    ║
-    ║ Giorni:     {str(args.days if args.days else 'Tutti'):>30}    ║
-    ║ Thread:     {str(args.workers if args.workers else 'Auto'):>30}    ║
-    ║ Smart Year: {'No' if args.no_smart_year else 'Sì':>30}    ║
+    ║           (Modalità Interattiva)             ║
     ╚══════════════════════════════════════════════╝
     """
     )
 
-    # Crea downloader
+    # Avvia sempre in modalità interattiva
     downloader = BinanceDataDownloader(
-        symbol=args.symbol,
-        interval=args.interval,
-        data_type=args.data_type,
-        frequency=args.frequency,
-        years_filter=args.years,
-        months_filter=args.months,
-        days_filter=args.days,
-        download_dir=os.path.join(args.output_dir, "zips"),
-        output_dir=os.path.join(args.output_dir, "parquet"),
+        symbol="BTCUSDT",
+        interval="1m",
+        data_type="futures/um",
+        frequency="monthly",
+        base_dir="binance_data",
     )
 
-    # Imposta configurazione da parametri
-    if args.no_skip_existing:
-        downloader.config["skip_existing_files"] = False
-
-    if args.no_smart_year:
-        downloader.config["smart_year_detection"] = False
-
-    if args.keep_zip:
-        downloader.config["delete_zip_after_conversion"] = False
-        downloader.config["always_ask_delete_zip"] = False
-
-    if args.force_delete_zip:
-        downloader.config["delete_zip_after_conversion"] = True
-        downloader.config["always_ask_delete_zip"] = False
-
-    downloader.save_config()
-
-    # Download
-    downloaded = downloader.download_all(
-        max_workers=args.workers if args.workers else None
-    )
-
-    if downloaded and not args.no_convert:
-        # Determina se eliminare i file ZIP
-        delete_zip = None
-        if args.delete_zip or args.force_delete_zip:
-            delete_zip = True
-        elif args.keep_zip:
-            delete_zip = False
-
-        # Conversione in Parquet
-        downloader.extract_to_parquet(delete_zip=delete_zip)
-
-    print("\n🎉 OPERAZIONE COMPLETATA!")
+    downloader.interactive_mode()
 
 
 if __name__ == "__main__":
